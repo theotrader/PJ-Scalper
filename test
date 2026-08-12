@@ -1,0 +1,1482 @@
+//+------------------------------------------------------------------+
+//| NFP_Breakout_EA_v1.mq5                                           |
+//| News Breakout Bot - v1  (FIX: deal-confirmed trigger detection)  |
+//|                                                                    |
+//| Strategie (samengevat):                                          |
+//|  - Handmatige NewsDate/NewsTime (server tijd)                     |
+//|  - Arming: symmetrische BUY STOP / SELL STOP die met de markt     |
+//|    meeschuiven                                                    |
+//|  - Freeze vlak voor het nieuws: orders bevriezen op laatste stand |
+//|  - Bij trigger: tegenoverliggende order verwijderen, initiele SL  |
+//|    = 0.5 x ATR, daarna breakeven bij eerste profit en agressieve  |
+//|    percentage-based trailing (geen vaste TP)                     |
+//|  - Risk-per-trade lot sizing                                     |
+//|  - Eén cycle per news event                                      |
+//|                                                                    |
+//| FIX LOG (deze versie):                                            |
+//|  Root cause van "verdwijnende pending orders zonder trade":       |
+//|  CheckTriggers() gebruikte OrderSelect(ticket) om te bepalen of   |
+//|  een pending order "getriggerd" was (order niet meer selecteer-   |
+//|  baar => aangenomen: gevuld). Dat is fout: een order kan ook      |
+//|  verdwijnen door verwijdering, expiry, of een tijdelijke          |
+//|  select-hik zonder dat er ooit een deal/positie is ontstaan.      |
+//|  Bovendien werd g_buyStopTicket/g_sellStopTicket ONVOORWAARDELIJK |
+//|  op 0 gezet, ook als er geen bijbehorende positie gevonden werd - |
+//|  hierdoor verloor de EA het spoor van de order zonder ooit een    |
+//|  daadwerkelijke fill te hebben bevestigd.                         |
+//|                                                                    |
+//|  Deze versie bepaalt een trigger UITSLUITEND via                  |
+//|  OnTradeTransaction() / TRADE_TRANSACTION_DEAL_ADD, met expliciete|
+//|  koppeling DEAL_ORDER -> onze pending ticket -> DEAL_POSITION_ID. |
+//|  CheckTriggers() is nu puur diagnostisch/logging en verandert     |
+//|  nooit meer de state.                                             |
+//|                                                                    |
+//| FIX v1.02: dedupe van "PENDING VERDWENEN"-logging (voorheen elke  |
+//|  tick herhaald). Elk ticket wordt nu maximaal 1x als verdwenen    |
+//|  gelogd (zie g_buyStopDisappearLogged/g_sellStopDisappearLogged), |
+//|  zonder dat dit een latere echte DEAL_ADD-confirmatie blokkeert.  |
+//|                                                                    |
+//| FIX v1.03: margin-bewuste lot sizing. De EA berekent nog steeds   |
+//|  eerst de risk-based lot size (RiskPercentPerOrder), maar verlaagt|
+//|  het volume nu automatisch naar het maximaal betaalbare volume    |
+//|  (via OrderCalcMargin(), met SYMBOL_VOLUME_STEP/MIN/MAX) als de   |
+//|  risk-based lot size de beschikbare margin overschrijdt. Alleen   |
+//|  als zelfs SYMBOL_VOLUME_MIN onbetaalbaar is, wordt die kant van  |
+//|  de order niet geplaatst (met duidelijke logging). RiskPercent-   |
+//|  PerOrder zelf wordt NOOIT aangepast. Zie CalculateLotSize() en   |
+//|  de nieuwe ApplyMarginConstraint().                               |
+//|                                                                    |
+//| FIX v1.04: robuustere MaxAffordableLots-bepaling + freeze-fix.    |
+//|  (1) ApplyMarginConstraint() sprong voorheen naar SYMBOL_VOLUME_  |
+//|      MIN zodra de 1.0-lot-schatting via OrderCalcMargin() faalde, |
+//|      zonder het werkelijke betaalbare bereik te doorzoeken. Nu    |
+//|      wordt via DetermineMaxAffordableLots() het ECHTE maximaal    |
+//|      betaalbare volume bepaald met een binaire zoekopdracht over  |
+//|      het volledige [SYMBOL_VOLUME_MIN..SYMBOL_VOLUME_MAX]-bereik  |
+//|      (stap-genormaliseerd), volledig onafhankelijk van riskLots.  |
+//|      FinalLots = MIN(riskLots, echte MaxAffordableLots), nooit    |
+//|      hoger dan het risk-model, nooit blind naar 0.01.             |
+//|  (2) Elke OrderCalcMargin()-failure logt nu uitgebreide diagnose: |
+//|      _LastError, GetLastError(), symbol/type/price/volume,        |
+//|      FreeMargin, VOLUME_MIN/MAX/STEP, CONTRACT_SIZE, CALC_MODE en |
+//|      CURRENCY_MARGIN (zie TryCalcMargin()/LogMarginCalcFailure()).|
+//|  (3) FreezeOrders() bevriest niet langer 0.00000-prijzen als een  |
+//|      of beide pending orders nooit succesvol geplaatst zijn (bv.  |
+//|      door te hoge spread). De EA logt dan duidelijk dat de cycle  |
+//|      NIET (volledig) gewapend kon worden, i.p.v. een misleidende  |
+//|      "FREEZE ACTIEF ... 0.00000" melding te geven.                |
+//|                                                                    |
+//| FIX v1.05: cross-checked margin (voorkomt "MaxAffordableLots=100"|
+//|  gevolgd door een latere REJECTED), veiligheidsbuffer, gecombi-   |
+//|  neerde BUY+SELL-marge-check, spread filter standaard UIT, en     |
+//|  minder logspam op ORDER_UPDATE. Zie CrossCheckedMargin(),        |
+//|  ManualMarginEstimate(), EnforceCombinedMarginBudget() en de      |
+//|  hernoemde input UseSpreadFilter (default false).                 |
+//|                                                                    |
+//| LET OP: dit is een geautomatiseerd trading-systeem. Testen op een |
+//| demo-account en op de historische spread/latency van je broker    |
+//| wordt sterk aangeraden voordat dit live wordt ingezet. Dit is     |
+//| geen financieel advies - de EA voert exact uit wat is ingesteld.  |
+//+------------------------------------------------------------------+
+#property copyright "NFP Breakout EA v1"
+#property version   "1.05"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//==================== INPUTS =========================================
+
+// ---- NEWS ----
+input group "=== NEWS TIMING ==="
+input string   NewsDate               = "2026.09.05";   // Format: YYYY.MM.DD (server tijd)
+input string   NewsTime               = "14:30:00";      // Format: HH:MM:SS (server tijd)
+input bool     UseManualNewsTime      = true;             // v1: altijd handmatig
+input int      ArmingSeconds          = 10;               // Sec vóór news dat arming start
+input int      FreezeMilliseconds     = 500;               // ms vóór news dat orders bevriezen
+
+// ---- PENDING ORDERS ----
+input group "=== PENDING ORDERS ==="
+input double   PendingDistance        = 1.00;              // Prijsafstand (niet pips), bv. $1.00 voor XAUUSD
+input double   MinModifyDistance      = 0.05;               // Min. prijsverschil om modify te sturen
+
+// ---- ATR / INITIAL SL ----
+input group "=== ATR / INITIAL SL ==="
+input ENUM_TIMEFRAMES ATR_Timeframe   = PERIOD_M1;
+input int      ATR_Period             = 14;
+input double   InitialSL_ATR_Multiplier = 0.5;
+
+// ---- PROFIT MANAGEMENT ----
+input group "=== PROFIT MANAGEMENT ==="
+input double   ProfitActivation       = 0.01;               // In account currency
+input double   TrailingProfitPercentage = 75.0;              // 70-90% aanbevolen
+
+// ---- RISK ----
+input group "=== RISK ==="
+input double   RiskPercentPerOrder    = 50.0;                // % van equity per individuele order
+input double   MarginSafetyBufferPercent = 10.0;             // Veiligheidsmarge (%) afgetrokken van free margin vóór lot-sizing (FIX v1.05)
+
+// ---- SPREAD ----
+input group "=== SPREAD FILTER ==="
+input bool     UseSpreadFilter        = false;               // FIX: standaard UIT, zodat spread orderplaatsing niet blokkeert
+input double   MaxSpread              = 5.0;                 // In punten (points), broker-afhankelijk, alleen relevant als UseSpreadFilter=true
+
+//==================== STATE ============================================
+
+enum CycleState
+  {
+   STATE_IDLE,          // wacht op arming tijd
+   STATE_ARMED,         // pending orders volgen de markt
+   STATE_FROZEN,        // orders bevroren, wachten op news
+   STATE_TRIGGERED,     // een kant is getriggerd, positie(s) worden gemanaged
+   STATE_DONE           // cycle afgerond, wacht op nieuwe NewsDate/NewsTime
+  };
+
+CycleState g_state = STATE_IDLE;
+
+datetime g_newsDateTime   = 0;
+datetime g_armingDateTime = 0;
+
+ulong    g_buyStopTicket  = 0;
+ulong    g_sellStopTicket = 0;
+
+bool     g_buyStopRemoved  = false;   // definitief: order is weg (fill OF cancel), niet meer relevant
+bool     g_sellStopRemoved = false;
+
+// Flags: wij hebben zelf een TRADE_ACTION_REMOVE gestuurd voor deze ticket.
+// Gebruikt om in OnTradeTransaction ORDER_DELETE-logging te labelen als "verwacht" i.p.v. "onverwacht verdwenen".
+bool     g_buyStopRemovalRequestedByUs  = false;
+bool     g_sellStopRemovalRequestedByUs = false;
+
+// FIX v1.02: dedupe-state voor "PENDING VERDWENEN"-logging. Zonder dit werd
+// dezelfde melding elke tick/timer (~15-30ms) herhaald zolang een ticket niet
+// meer selecteerbaar was maar nog niet bevestigd/gecleared. Deze vlaggen zorgen
+// dat we per ticket maximaal 1x loggen. BELANGRIJK: dit beïnvloedt UITSLUITEND
+// de logging - het blokkeert nooit een latere echte DEAL_ADD-confirmatie,
+// want g_buyStopTicket/g_sellStopTicket zelf worden hier niet door aangeraakt.
+// Gereset wordt uitsluitend bij het plaatsen van een nieuw pending-orderpaar.
+bool     g_buyStopDisappearLogged        = false;
+ulong    g_buyStopDisappearLoggedTicket  = 0;
+bool     g_sellStopDisappearLogged       = false;
+ulong    g_sellStopDisappearLoggedTicket = 0;
+
+// FIX v1.05: dedupe-state voor TRADE_TRANSACTION_ORDER_UPDATE-logging. Deze
+// transactie kan meerdere keren vuren zonder dat de order_state daadwerkelijk
+// verandert; we loggen alleen bij een ECHTE statuswijziging. -1 = "nog nooit
+// gelogd voor dit ticket" (gereset bij het plaatsen van een nieuw ticket).
+int      g_buyStopLastLoggedState  = -1;
+int      g_sellStopLastLoggedState = -1;
+
+double   g_lastBuyStopPrice  = 0;
+double   g_lastSellStopPrice = 0;
+
+double   g_frozenBuyPrice  = 0;
+double   g_frozenSellPrice = 0;
+
+double   g_initialATR = 0;
+bool     g_atrCaptured = false;
+
+// Per-positie management (ondersteunt max 2 gelijktijdige posities, zie §18)
+struct PositionMgmt
+  {
+   ulong    ticket;
+   bool     active;
+   bool     breakevenDone;
+   double   maxProfit;
+   double   initialSL;
+   double   entryPrice;
+   ENUM_POSITION_TYPE posType;
+  };
+PositionMgmt g_positions[2];
+
+string g_newsDateTimeStr = "";
+
+//==================== UTILITY: LOGGING ==================================
+
+void LogEvent(string msg)
+  {
+   Print("[NFP-EA] ", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), " | ", msg);
+  }
+
+//==================== UTILITY: ENUM -> LEESBARE STRING =======================
+// FIX v1.02: leesbare vertaling zodat Journal-meldingen zelfverklarend zijn
+// i.p.v. kale integers (bv. "5" -> "REJECTED"). Gebaseerd op de officiële
+// MQL5 ENUM_ORDER_STATE / ENUM_ORDER_TYPE definities. Staat bewust vroeg in
+// het bestand (direct na LogEvent), omdat MQL5 - net als C - een functie
+// vóór het eerste gebruik gedefinieerd wil hebben (o.a. nodig voor
+// LogMarginCalcFailure() verderop, FIX v1.04).
+
+string OrderStateToString(int state)
+  {
+   switch(state)
+     {
+      case ORDER_STATE_STARTED:        return "STARTED (gecontroleerd, nog niet geaccepteerd)";
+      case ORDER_STATE_PLACED:         return "PLACED (actief, geaccepteerd)";
+      case ORDER_STATE_CANCELED:       return "CANCELED (door client/EA verwijderd)";
+      case ORDER_STATE_PARTIAL:        return "PARTIAL (deels uitgevoerd)";
+      case ORDER_STATE_FILLED:         return "FILLED (volledig uitgevoerd)";
+      case ORDER_STATE_REJECTED:       return "REJECTED (afgewezen door broker/server)";
+      case ORDER_STATE_EXPIRED:        return "EXPIRED (verlopen)";
+      case ORDER_STATE_REQUEST_ADD:    return "REQUEST_ADD (wordt geregistreerd)";
+      case ORDER_STATE_REQUEST_MODIFY: return "REQUEST_MODIFY (wordt aangepast)";
+      case ORDER_STATE_REQUEST_CANCEL: return "REQUEST_CANCEL (wordt verwijderd)";
+      default:                         return StringFormat("ONBEKEND(%d)", (int)state);
+     }
+  }
+
+string OrderTypeToString(int otype)
+  {
+   switch(otype)
+     {
+      case ORDER_TYPE_BUY:             return "BUY";
+      case ORDER_TYPE_SELL:            return "SELL";
+      case ORDER_TYPE_BUY_LIMIT:       return "BUY_LIMIT";
+      case ORDER_TYPE_SELL_LIMIT:      return "SELL_LIMIT";
+      case ORDER_TYPE_BUY_STOP:        return "BUY_STOP";
+      case ORDER_TYPE_SELL_STOP:       return "SELL_STOP";
+      case ORDER_TYPE_BUY_STOP_LIMIT:  return "BUY_STOP_LIMIT";
+      case ORDER_TYPE_SELL_STOP_LIMIT: return "SELL_STOP_LIMIT";
+      case ORDER_TYPE_CLOSE_BY:        return "CLOSE_BY";
+      default:                         return StringFormat("ONBEKEND(%d)", (int)otype);
+     }
+  }
+
+//==================== UTILITY: SYMBOL / PRICE ============================
+
+double GetAsk() { return SymbolInfoDouble(_Symbol, SYMBOL_ASK); }
+double GetBid() { return SymbolInfoDouble(_Symbol, SYMBOL_BID); }
+double GetMid() { return (GetAsk()+GetBid())/2.0; }
+
+double GetSpreadPoints()
+  {
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point <= 0) return 0;
+   return (GetAsk()-GetBid())/point;
+  }
+
+double NormalizePrice(double price)
+  {
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   return NormalizeDouble(price, digits);
+  }
+
+//==================== UTILITY: LOT SIZE CALC =============================
+
+double CalculateLotSize(double entryPrice, double slPrice)
+  {
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * (RiskPercentPerOrder/100.0);
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0 || tickValue <= 0)
+     {
+      LogEvent("FOUT: kan tick value/size niet ophalen voor " + _Symbol);
+      return 0;
+     }
+
+   double slDistance = MathAbs(entryPrice - slPrice);
+   if(slDistance <= 0)
+     {
+      LogEvent("FOUT: SL afstand is 0, kan lot niet berekenen");
+      return 0;
+     }
+
+   double valuePerLot = (slDistance / tickSize) * tickValue; // verlies per 1.0 lot bij deze SL afstand
+   if(valuePerLot <= 0)
+     {
+      LogEvent("FOUT: valuePerLot <= 0");
+      return 0;
+     }
+
+   double lots = riskMoney / valuePerLot;
+
+   double minVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   if(volStep > 0)
+      lots = MathFloor(lots/volStep) * volStep;
+
+   if(lots < minVol) lots = minVol;
+   if(lots > maxVol) lots = maxVol;
+
+   lots = NormalizeDouble(lots, 2);
+
+   LogEvent(StringFormat("RISK LOTS | Equity=%.2f | Risk%%=%.1f | RiskMoney=%.2f | SL=%.5f | RiskLots=%.2f",
+            equity, RiskPercentPerOrder, riskMoney, slDistance, lots));
+
+   return lots;
+  }
+
+//==================== MARGIN-BEWUSTE LOT SIZING (FIX v1.03 / v1.04 / v1.05) =
+// DOEL: nooit een trade missen omdat de risk-based lot size groter is dan wat
+// de account daadwerkelijk kan dragen, MAAR ook nooit een lotsize kiezen die
+// de broker later alsnog afwijst (REJECTED) omdat de margin-inschatting te
+// optimistisch was. RiskPercentPerOrder blijft het STREEFDOEL; de werkelijk
+// beschikbare (en met een veiligheidsmarge verminderde) free margin is de
+// HARDE bovengrens op het uiteindelijke volume.
+//
+// FIX v1.05 - kern van deze update:
+//  (1) ROOT CAUSE "MaxAffordableLots=100.00" gevolgd door REJECTED:
+//      De vorige versie vertrouwde blind op ÉÉN enkele succesvolle
+//      OrderCalcMargin()-call op SYMBOL_VOLUME_MAX. Op deze broker/symbool
+//      bleek die call een veel te lage margin terug te geven (of de broker
+//      accepteert het orderVOLUME op calc-tijdstip anders dan op fill-      
+//      tijdstip), waardoor de EA dacht dat 100 lots betaalbaar was terwijl
+//      3.43 lots later alsnog REJECTED werd. OrderCalcMargin() alleen is dus
+//      NIET betrouwbaar genoeg op dit account. Oplossing: CrossCheckedMargin()
+//      berekent ALTIJD ook een onafhankelijke handmatige schatting (contract-
+//      grootte x prijs x volume / leverage, of SYMBOL_MARGIN_INITIAL indien
+//      beschikbaar) en gebruikt het HOOGSTE (dus conservatiefste) van beide
+//      als de daadwerkelijke vereiste marge. Zo kan een afwijkende/optimis-
+//      tische API-uitkomst nooit meer alleen bepalend zijn.
+//  (2) Als OrderCalcMargin() zelf faalt, wordt NIET meer teruggevallen op
+//      SYMBOL_VOLUME_MIN, maar wordt de handmatige schatting gebruikt als
+//      volwaardige vervanging (zie MARGIN CHECK FALLBACK-log).
+//  (3) MarginSafetyBufferPercent (nieuwe input) trekt een veiligheidsmarge af
+//      van de beschikbare free margin vóórdat er gezocht wordt, zodat kleine
+//      prijsbewegingen/spread tussen berekening en daadwerkelijke plaatsing
+//      niet alsnog tot een REJECTED pending order leiden.
+//  (4) EnforceCombinedMarginBudget() controleert of BUY+SELL tegelijk (zoals
+//      de EA ze plaatst) binnen de (met buffer verminderde) free margin
+//      passen, en verlaagt zo nodig het volume van de duurdere kant verder,
+//      voor het geval de broker margin reserveert voor beide open pending
+//      orders tegelijk.
+// FinalLots = MIN(riskLots, echte MaxAffordableLots) - nooit hoger dan het
+// risk-model, nooit blind teruggevallen naar 0.01, en nooit een volume dat we
+// redelijkerwijs al konden weten dat de broker zou afwijzen.
+
+//---- Diagnostische logging bij een falende OrderCalcMargin()-call ----------
+void LogMarginCalcFailure(ENUM_ORDER_TYPE orderType, double price, double volume, string label)
+  {
+   int    lastErr      = GetLastError(); // reset de fouttoestand na uitlezen
+   double freeMargin    = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double minVol        = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVol        = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volStep       = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double contractSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   long   calcMode      = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_CALC_MODE);
+   string marginCurrency= SymbolInfoString(_Symbol, SYMBOL_CURRENCY_MARGIN);
+   long   leverage      = AccountInfoInteger(ACCOUNT_LEVERAGE);
+
+   LogEvent(StringFormat(
+      "OrderCalcMargin FAALDE [%s] | _LastError=%d GetLastError()=%d | symbol=%s orderType=%s price=%.5f volume=%.2f | "
+      "FreeMargin=%.2f | VOLUME_MIN=%.2f VOLUME_MAX=%.2f VOLUME_STEP=%.2f | "
+      "CONTRACT_SIZE=%.2f CALC_MODE=%d CURRENCY_MARGIN=%s Leverage=1:%d",
+      label, _LastError, lastErr, _Symbol, OrderTypeToString((int)orderType), price, volume,
+      freeMargin, minVol, maxVol, volStep, contractSize, (int)calcMode, marginCurrency, (int)leverage));
+  }
+
+//---- Wrapper rond OrderCalcMargin() met automatische diagnose bij failure --
+bool TryCalcMargin(ENUM_ORDER_TYPE orderType, double price, double volume, double &outMargin, string label)
+  {
+   ResetLastError();
+   outMargin = 0;
+   bool ok = OrderCalcMargin(orderType, _Symbol, volume, price, outMargin);
+   if(!ok)
+      LogMarginCalcFailure(orderType, price, volume, label);
+   return ok;
+  }
+
+//---- FIX v1.05: onafhankelijke, handmatige marge-schatting -----------------
+// Gebruikt SYMBOL_MARGIN_INITIAL (indien de broker die publiceert - dit is de
+// meest accurate bron) of anders de standaardformule
+// Margin = Volume x ContractSize x Prijs / Leverage. Dit is bewust een
+// TWEEDE, onafhankelijke bron naast OrderCalcMargin(), puur om een te
+// optimistische/afwijkende API-uitkomst te kunnen detecteren en overrulen.
+double ManualMarginEstimate(double volume, double price)
+  {
+   double marginInitial = SymbolInfoDouble(_Symbol, SYMBOL_MARGIN_INITIAL);
+   if(marginInitial > 0)
+      return volume * marginInitial;
+
+   double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+   if(contractSize <= 0) contractSize = 100.0; // typische XAUUSD-contractgrootte als noodfallback
+
+   long leverage = AccountInfoInteger(ACCOUNT_LEVERAGE);
+   if(leverage <= 0) leverage = 100; // conservatieve noodfallback als broker geen leverage rapporteert
+
+   if(price <= 0) return DBL_MAX; // ongeldige prijs -> nooit "betaalbaar" lijken
+
+   return (volume * contractSize * price) / (double)leverage;
+  }
+
+//---- FIX v1.05: de daadwerkelijk te gebruiken (conservatieve) marge --------
+// Combineert OrderCalcMargin() met ManualMarginEstimate(). Retourneert altijd
+// een bruikbare schatting (nooit "geen idee"): als de API-call slaagt, wordt
+// het HOOGSTE van API- en handmatige schatting gebruikt (conservatief -
+// voorkomt een té optimistische API-uitkomst zoals bij het gerapporteerde
+// MaxAffordableLots=100.00-incident). Als de API-call faalt, wordt volledig op
+// de handmatige schatting teruggevallen, met de exact gevraagde FALLBACK-log.
+double CrossCheckedMargin(ENUM_ORDER_TYPE orderType, double price, double volume, string label)
+  {
+   double apiMargin = 0;
+   bool apiOk = TryCalcMargin(orderType, price, volume, apiMargin, label);
+   double manualMargin = ManualMarginEstimate(volume, price);
+
+   if(!apiOk)
+     {
+      LogEvent(StringFormat(
+         "MARGIN CHECK FALLBACK | %s | OrderCalcMargin failed | error=%d | using actual volume feasibility test (manual estimate=%.2f voor volume=%.2f)",
+         label, _LastError, manualMargin, volume));
+      return manualMargin;
+     }
+
+   // Beide schattingen beschikbaar: neem de conservatiefste (hoogste), zodat
+   // een afwijkende/te-lage API-uitkomst nooit alleen bepalend is.
+   return MathMax(apiMargin, manualMargin);
+  }
+
+//---- FIX v1.04/v1.05: bepaalt het ECHTE maximaal betaalbare volume ---------
+// Binaire zoekopdracht (gecombineerd met volume-step-normalisatie) over het
+// volledige geldige volumebereik van het symbool, ONAFHANKELIJK van riskLots,
+// nu gebaseerd op de conservatieve CrossCheckedMargin() i.p.v. de kale
+// OrderCalcMargin()-uitkomst. `budget` is de free margin NA aftrek van de
+// veiligheidsbuffer (zie MarginSafetyBufferPercent/ApplyMarginConstraint).
+double DetermineMaxAffordableLots(ENUM_ORDER_TYPE orderType, double price, string label, double budget)
+  {
+   double minVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(volStep <= 0) volStep = 0.01;
+   if(minVol  <= 0) minVol  = volStep;
+   if(maxVol  < minVol) maxVol = minVol;
+
+   long maxIndex = (long)MathRound((maxVol - minVol)/volStep);
+   if(maxIndex < 0) maxIndex = 0;
+
+   // Snelle top-check: is het volledige SYMBOL_VOLUME_MAX al betaalbaar?
+   // Gebruikt nu de CONSERVATIEVE cross-checked marge i.p.v. alleen de API,
+   // dus deze snelle check kan niet meer op een enkele optimistische
+   // OrderCalcMargin()-uitkomst uitkomen zoals bij het gerapporteerde
+   // MaxAffordableLots=100.00-geval.
+   double reqMarginTop = CrossCheckedMargin(orderType, price, maxVol, label);
+   if(reqMarginTop <= budget)
+      return NormalizeDouble(maxVol, 2);
+
+   if(maxIndex <= 0)
+      return 0.0; // enige mogelijke volume was maxVol==minVol en dat faalde al
+
+   // Binaire zoekopdracht naar de hoogste index (=hoogste volume) die binnen
+   // het budget past volgens de conservatieve marge-schatting.
+   long lo = 0, hi = maxIndex - 1, bestIndex = -1;
+   while(lo <= hi)
+     {
+      long mid = (lo + hi) / 2;
+      double vol = NormalizeDouble(minVol + mid*volStep, 2);
+
+      double reqMargin = CrossCheckedMargin(orderType, price, vol, label);
+      bool affordable = (reqMargin <= budget);
+
+      if(affordable)
+        {
+         bestIndex = mid;
+         lo = mid + 1;   // probeer nog hoger
+        }
+      else
+        {
+         hi = mid - 1;   // te duur -> probeer lager
+        }
+     }
+
+   if(bestIndex < 0)
+      return 0.0; // zelfs SYMBOL_VOLUME_MIN bleek niet betaalbaar
+
+   return NormalizeDouble(minVol + bestIndex*volStep, 2);
+  }
+
+double ApplyMarginConstraint(ENUM_ORDER_TYPE orderType, double price, double riskBasedLots, string label, double budget)
+  {
+   double minVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(volStep <= 0) volStep = 0.01;
+   if(minVol  <= 0) minVol  = volStep;
+
+   // A) Risk-based lots normaliseren naar step/min/max (CalculateLotSize()
+   //    doet dit ook al, maar defensief opnieuw hier zodat deze functie ook
+   //    los bruikbaar/testbaar blijft).
+   double riskLots = riskBasedLots;
+   if(volStep > 0) riskLots = MathFloor(riskLots/volStep) * volStep;
+   if(riskLots < minVol) riskLots = minVol;
+   if(riskLots > maxVol) riskLots = maxVol;
+   riskLots = NormalizeDouble(riskLots, 2);
+
+   // B) Het ECHTE maximaal betaalbare volume bepalen (cross-checked, dus
+   //    conservatief) - volledig onafhankelijk van riskLots.
+   double maxAffordableLots = DetermineMaxAffordableLots(orderType, price, label, budget);
+
+   if(maxAffordableLots <= 0)
+     {
+      LogEvent(StringFormat(
+         "MARGIN CHECK %s | requested=%.2f | maxAffordable=0.00 | final=0.00 | freeMargin(na buffer)=%.2f | GEEN ORDER: zelfs minimum volume %.2f niet betaalbaar",
+         label, riskLots, budget, minVol));
+      return 0.0;
+     }
+
+   // C) FinalLots = MIN(riskLots, maxAffordableLots) - het risk-model mag
+   //    NOOIT overschreden worden, ook niet als er meer margin beschikbaar is.
+   double finalLots = MathMin(riskLots, maxAffordableLots);
+   if(volStep > 0) finalLots = MathFloor(finalLots/volStep) * volStep;
+   if(finalLots < minVol) finalLots = 0.0;
+   finalLots = NormalizeDouble(finalLots, 2);
+
+   if(finalLots <= 0)
+     {
+      LogEvent(StringFormat(
+         "MARGIN CHECK %s | requested=%.2f | maxAffordable=%.2f | final=0.00 | freeMargin(na buffer)=%.2f | GEEN ORDER: finalLots na afronding 0",
+         label, riskLots, maxAffordableLots, budget));
+      return 0.0;
+     }
+
+   // E) Laatste, expliciete bevestiging van finalLots via CrossCheckedMargin().
+   //    Door monotonie zou dit altijd moeten slagen, maar dit is het laatste
+   //    veiligheidsnet tegen afrondings-/tick-races.
+   while(finalLots >= minVol - (volStep/2.0))
+     {
+      double confirmMargin = CrossCheckedMargin(orderType, price, finalLots, label);
+      if(confirmMargin <= budget)
+         break;
+      finalLots = NormalizeDouble(finalLots - volStep, 2);
+     }
+   if(finalLots < minVol - (volStep/2.0))
+     {
+      LogEvent(StringFormat(
+         "MARGIN CHECK %s | requested=%.2f | maxAffordable=%.2f | final=0.00 | freeMargin(na buffer)=%.2f | GEEN ORDER: eindbevestiging mislukte zelfs op minimum volume",
+         label, riskLots, maxAffordableLots, budget));
+      return 0.0;
+     }
+
+   LogEvent(StringFormat(
+      "MARGIN CHECK %s | requested=%.2f | maxAffordable=%.2f | final=%.2f | freeMargin(na buffer)=%.2f%s",
+      label, riskLots, maxAffordableLots, finalLots, budget,
+      (finalLots < riskLots ? " | volume verlaagd wegens beschikbare margin" : " | geen volume beperking")));
+
+   return finalLots;
+  }
+
+//---- FIX v1.05: combineert BUY- en SELL-margin, voor brokers die margin ----
+// reserveren voor BEIDE gelijktijdig open pending orders. Verlaagt zo nodig
+// de duurdere kant (in stappen van SYMBOL_VOLUME_STEP) totdat de gecombineerde
+// vereiste marge weer binnen het budget past, of totdat beide kanten op
+// SYMBOL_VOLUME_MIN staan (dan kan er niet verder verlaagd worden).
+void EnforceCombinedMarginBudget(ENUM_ORDER_TYPE buyType, double buyPrice, double &buyLots,
+                                  ENUM_ORDER_TYPE sellType, double sellPrice, double &sellLots,
+                                  double budget)
+  {
+   if(buyLots <= 0 || sellLots <= 0)
+      return; // als één kant al niet geplaatst wordt, is er niets te combineren
+
+   double minVol  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(volStep <= 0) volStep = 0.01;
+   if(minVol  <= 0) minVol  = volStep;
+
+   int guard = 0; // veiligheidslimiet tegen oneindige loops
+   while(guard < 10000)
+     {
+      guard++;
+      double marginBuy  = CrossCheckedMargin(buyType,  buyPrice,  buyLots,  "BUY(combined-check)");
+      double marginSell = CrossCheckedMargin(sellType, sellPrice, sellLots, "SELL(combined-check)");
+
+      if(marginBuy + marginSell <= budget)
+        {
+         LogEvent(StringFormat(
+            "MARGIN CHECK COMBINED | BUY=%.2f lots (margin=%.2f) + SELL=%.2f lots (margin=%.2f) = %.2f <= budget=%.2f -> OK",
+            buyLots, marginBuy, sellLots, marginSell, marginBuy+marginSell, budget));
+         return;
+        }
+
+      bool buyAtMin  = (buyLots  <= minVol + (volStep/2.0));
+      bool sellAtMin = (sellLots <= minVol + (volStep/2.0));
+      if(buyAtMin && sellAtMin)
+        {
+         LogEvent(StringFormat(
+            "MARGIN CHECK COMBINED WAARSCHUWING | BUY=%.2f + SELL=%.2f passen zelfs op minimumvolume niet samen binnen budget=%.2f (margin totaal=%.2f). Orders worden alsnog op minimumvolume geplaatst; de broker kan één kant alsnog weigeren.",
+            buyLots, sellLots, budget, marginBuy+marginSell));
+         return; // kan niet verder verlagen; laat de plaatsing het laatste woord geven
+        }
+
+      // Verlaag de kant met de hoogste vereiste marge het eerst (grootste besparing per stap).
+      if(marginBuy >= marginSell && !buyAtMin)
+         buyLots = NormalizeDouble(buyLots - volStep, 2);
+      else if(!sellAtMin)
+         sellLots = NormalizeDouble(sellLots - volStep, 2);
+      else if(!buyAtMin)
+         buyLots = NormalizeDouble(buyLots - volStep, 2);
+     }
+  }
+
+//==================== ATR ================================================
+
+int g_atrHandle = INVALID_HANDLE;
+
+double GetCurrentATR()
+  {
+   if(g_atrHandle == INVALID_HANDLE)
+      return 0;
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(g_atrHandle, 0, 0, 1, buf) <= 0)
+      return 0;
+   return buf[0];
+  }
+
+//==================== TIME PARSING =======================================
+
+datetime ParseNewsDateTime()
+  {
+   string dtStr = NewsDate + " " + NewsTime;
+   datetime dt = StringToTime(dtStr);
+   return dt;
+  }
+
+//==================== INIT ================================================
+
+int OnInit()
+  {
+   g_newsDateTime = ParseNewsDateTime();
+   if(g_newsDateTime <= 0)
+     {
+      LogEvent("FOUT: NewsDate/NewsTime kon niet geparsed worden. Formaat: YYYY.MM.DD / HH:MM:SS");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   g_armingDateTime = g_newsDateTime - ArmingSeconds;
+   g_newsDateTimeStr = TimeToString(g_newsDateTime, TIME_DATE|TIME_SECONDS);
+
+   LogEvent("EA geinitialiseerd. News event gepland op: " + g_newsDateTimeStr +
+            " | Arming start: " + TimeToString(g_armingDateTime, TIME_DATE|TIME_SECONDS));
+
+   g_atrHandle = iATR(_Symbol, ATR_Timeframe, ATR_Period);
+   if(g_atrHandle == INVALID_HANDLE)
+     {
+      LogEvent("FOUT: kon ATR handle niet aanmaken.");
+      return(INIT_FAILED);
+     }
+
+   for(int i=0;i<2;i++)
+     {
+      g_positions[i].ticket = 0;
+      g_positions[i].active = false;
+     }
+
+   // Snelste timer die MT5 betrouwbaar ondersteunt (millisecond timer)
+   EventSetMillisecondTimer(20); // 20ms tikken; dichter bij het news-moment gebruiken we tick-events zelf ook
+
+   g_state = STATE_IDLE;
+   return(INIT_SUCCEEDED);
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
+  }
+
+//==================== SPREAD CHECK ========================================
+
+bool SpreadOK()
+  {
+   if(!UseSpreadFilter) return true;
+   double spreadPts = GetSpreadPoints();
+   if(spreadPts > MaxSpread)
+     {
+      return false;
+     }
+   return true;
+  }
+
+//==================== PENDING ORDER MANAGEMENT ============================
+
+void PlaceInitialPendingOrders()
+  {
+   double mid = GetMid();
+   double buyPrice  = NormalizePrice(mid + PendingDistance);
+   double sellPrice = NormalizePrice(mid - PendingDistance);
+
+   if(!SpreadOK())
+     {
+      LogEvent("Spread te hoog bij plaatsen initiele orders, wacht op geldige spread.");
+      return;
+     }
+
+   // FIX v1.05: risk-based lots voor beide kanten eerst berekenen (ongewijzigde
+   // bestaande risk-formule via CalculateLotSize(), zie "RISK LOTS"-log daarin).
+   double atrNow = GetCurrentATR();
+   double estSL  = (atrNow>0) ? atrNow*InitialSL_ATR_Multiplier : PendingDistance*0.5;
+
+   double riskLotsBuy = CalculateLotSize(buyPrice, buyPrice-estSL);
+   if(riskLotsBuy <= 0) riskLotsBuy = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double riskLotsSell = CalculateLotSize(sellPrice, sellPrice+estSL);
+   if(riskLotsSell <= 0) riskLotsSell = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   // FIX v1.05: budget = beschikbare free margin MINUS veiligheidsbuffer, zodat
+   // kleine prijsbewegingen tussen deze berekening en de daadwerkelijke
+   // plaatsing niet alsnog tot een REJECTED pending order leiden (zie het
+   // gerapporteerde incident: geaccepteerd, 35s later toch REJECTED).
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double budget = freeMargin * (1.0 - (MarginSafetyBufferPercent/100.0));
+   if(budget < 0) budget = 0;
+   LogEvent(StringFormat("MARGIN BUDGET | FreeMargin=%.2f | VeiligheidsbufferPercent=%.1f | Budget=%.2f", freeMargin, MarginSafetyBufferPercent, budget));
+
+   // BUY en SELL volledig onafhankelijk van elkaar tegen hetzelfde budget toetsen.
+   double lots     = ApplyMarginConstraint(ORDER_TYPE_BUY_STOP,  buyPrice,  riskLotsBuy,  "BUY",  budget);
+   double lotsSell = ApplyMarginConstraint(ORDER_TYPE_SELL_STOP, sellPrice, riskLotsSell, "SELL", budget);
+
+   // FIX v1.05: als de broker margin reserveert voor BEIDE gelijktijdig open
+   // pending orders, kan de som van beide net zo min als het budget passen
+   // ook al pastte elke kant afzonderlijk. Verlaag zo nodig de duurdere kant.
+   EnforceCombinedMarginBudget(ORDER_TYPE_BUY_STOP, buyPrice, lots, ORDER_TYPE_SELL_STOP, sellPrice, lotsSell, budget);
+
+   MqlTradeRequest req; MqlTradeResult res;
+
+   // ---- BUY STOP ----
+   if(lots <= 0)
+     {
+      // Zelfs SYMBOL_VOLUME_MIN is onbetaalbaar voor deze kant - GEEN BUY STOP
+      // plaatsen. GEEN trigger, GEEN order; de SELL-kant wordt hierdoor niet
+      // beïnvloed en apart afgehandeld hieronder.
+      LogEvent("BUY STOP NIET geplaatst: onvoldoende margin voor zelfs het minimale volume.");
+     }
+   else
+     {
+      ZeroMemory(req); ZeroMemory(res);
+      req.action    = TRADE_ACTION_PENDING;
+      req.symbol    = _Symbol;
+      req.type      = ORDER_TYPE_BUY_STOP;
+      req.price     = buyPrice;
+      req.deviation = 0;
+      req.type_time = ORDER_TIME_GTC;
+      req.type_filling = ORDER_FILLING_FOK;
+      req.volume    = lots;
+
+      if(!OrderSend(req,res))
+         LogEvent(StringFormat("ORDER REJECTED | ticket=0 (OrderSend geweigerd) | requestedLots=%.2f | retcode=%d | reason=%s",
+                  lots, res.retcode, res.comment));
+      else
+        {
+         g_buyStopTicket = res.order;
+         g_lastBuyStopPrice = buyPrice;
+         g_buyStopRemoved = false;
+         g_buyStopRemovalRequestedByUs = false;
+         // FIX v1.02: dedupe-state resetten voor het nieuwe ticket, zodat een
+         // eventuele latere disappearance van DIT ticket weer (1x) gelogd wordt.
+         g_buyStopDisappearLogged = false;
+         g_buyStopDisappearLoggedTicket = 0;
+         // FIX v1.05: dedupe-state voor ORDER_UPDATE-logging ook resetten.
+         g_buyStopLastLoggedState = -1;
+         LogEvent(StringFormat("BUY STOP geplaatst | price=%.5f | lots=%.2f | ticket=%I64u", buyPrice, lots, g_buyStopTicket));
+        }
+     }
+
+   // ---- SELL STOP ----
+   if(lotsSell <= 0)
+     {
+      LogEvent("SELL STOP NIET geplaatst: onvoldoende margin voor zelfs het minimale volume.");
+     }
+   else
+     {
+      ZeroMemory(req); ZeroMemory(res);
+      req.action    = TRADE_ACTION_PENDING;
+      req.symbol    = _Symbol;
+      req.type      = ORDER_TYPE_SELL_STOP;
+      req.price     = sellPrice;
+      req.deviation = 0;
+      req.type_time = ORDER_TIME_GTC;
+      req.type_filling = ORDER_FILLING_FOK;
+      req.volume    = lotsSell;
+
+      if(!OrderSend(req,res))
+         LogEvent(StringFormat("ORDER REJECTED | ticket=0 (OrderSend geweigerd) | requestedLots=%.2f | retcode=%d | reason=%s",
+                  lotsSell, res.retcode, res.comment));
+      else
+        {
+         g_sellStopTicket = res.order;
+         g_lastSellStopPrice = sellPrice;
+         g_sellStopRemoved = false;
+         g_sellStopRemovalRequestedByUs = false;
+         g_sellStopDisappearLogged = false;
+         g_sellStopDisappearLoggedTicket = 0;
+         g_sellStopLastLoggedState = -1;
+         LogEvent(StringFormat("SELL STOP geplaatst | price=%.5f | lots=%.2f | ticket=%I64u", sellPrice, lotsSell, g_sellStopTicket));
+        }
+     }
+  }
+
+void ModifyPendingOrder(ulong ticket, double newPrice, string label)
+  {
+   if(ticket == 0) return;
+   if(!OrderSelect(ticket))
+      return;
+
+   double currentPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+   if(MathAbs(newPrice-currentPrice) < MinModifyDistance)
+      return; // te klein verschil, niet nodig
+
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action = TRADE_ACTION_MODIFY;
+   req.order  = ticket;
+   req.price  = newPrice;
+   req.type_time = ORDER_TIME_GTC;
+
+   if(!OrderSend(req,res))
+     {
+      LogEvent(StringFormat("MODIFY MISLUKT [%s] ticket=%I64u gewenst=%.5f actueel=%.5f retcode=%d - direct opnieuw proberen",
+               label, ticket, newPrice, currentPrice, res.retcode));
+      // directe retry
+      if(!OrderSend(req,res))
+         LogEvent(StringFormat("MODIFY OPNIEUW MISLUKT [%s] ticket=%I64u retcode=%d", label, ticket, res.retcode));
+      else
+        {
+         if(label=="BUY") g_lastBuyStopPrice = newPrice; else g_lastSellStopPrice = newPrice;
+        }
+     }
+   else
+     {
+      if(label=="BUY") g_lastBuyStopPrice = newPrice; else g_lastSellStopPrice = newPrice;
+     }
+  }
+
+void UpdateTrailingPendingOrders()
+  {
+   if(!SpreadOK())
+      return; // niet aanpassen bij te hoge spread
+
+   double mid = GetMid();
+   double buyPrice  = NormalizePrice(mid + PendingDistance);
+   double sellPrice = NormalizePrice(mid - PendingDistance);
+
+   if(g_buyStopTicket != 0 && !g_buyStopRemoved)
+      ModifyPendingOrder(g_buyStopTicket, buyPrice, "BUY");
+   if(g_sellStopTicket != 0 && !g_sellStopRemoved)
+      ModifyPendingOrder(g_sellStopTicket, sellPrice, "SELL");
+  }
+
+void RemovePendingOrder(ulong ticket, string label)
+  {
+   if(ticket == 0) return;
+   if(!OrderSelect(ticket)) return;
+
+   // Markeer dat WIJ deze verwijdering initiëren, zodat de ORDER_DELETE-transactie
+   // straks correct gelabeld wordt als "verwacht" i.p.v. "onverklaard verdwenen".
+   if(label=="BUY")  g_buyStopRemovalRequestedByUs  = true;
+   if(label=="SELL") g_sellStopRemovalRequestedByUs = true;
+
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action = TRADE_ACTION_REMOVE;
+   req.order  = ticket;
+
+   if(!OrderSend(req,res))
+      LogEvent(StringFormat("FOUT bij verwijderen %s STOP ticket=%I64u retcode=%d", label, ticket, res.retcode));
+   else
+      LogEvent(StringFormat("%s STOP verwijderd (ticket=%I64u)", label, ticket));
+  }
+
+//==================== SL PLACEMENT (met retry) =============================
+
+bool EnsureStopLoss(ulong posTicket, double slPrice)
+  {
+   if(!PositionSelectByTicket(posTicket))
+      return false;
+
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP); // TP blijft altijd 0 / uit
+   slPrice = NormalizePrice(slPrice);
+
+   if(MathAbs(currentSL - slPrice) < _Point) 
+      return true; // al correct
+
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = posTicket;
+   req.symbol   = _Symbol;
+   req.sl       = slPrice;
+   req.tp       = 0; // geen vaste TP, §16
+
+   if(!OrderSend(req,res))
+     {
+      LogEvent(StringFormat("SL PLAATSING MISLUKT ticket=%I64u gewenst SL=%.5f retcode=%d - direct retry", posTicket, slPrice, res.retcode));
+      if(!OrderSend(req,res))
+        {
+         LogEvent(StringFormat("SL PLAATSING OPNIEUW MISLUKT ticket=%I64u retcode=%d", posTicket, res.retcode));
+         return false;
+        }
+     }
+   LogEvent(StringFormat("SL geplaatst/aangepast: ticket=%I64u SL=%.5f", posTicket, slPrice));
+   return true;
+  }
+
+//==================== POSITION -> MGMT SLOT MAPPING ========================
+
+int FindOrCreateMgmtSlot(ulong ticket)
+  {
+   for(int i=0;i<2;i++)
+      if(g_positions[i].active && g_positions[i].ticket==ticket)
+         return i;
+   for(int i=0;i<2;i++)
+      if(!g_positions[i].active)
+         return i;
+   return -1;
+  }
+
+void InitPositionManagement(ulong posTicket)
+  {
+   int slot = FindOrCreateMgmtSlot(posTicket);
+   if(slot < 0)
+     {
+      LogEvent("FOUT: geen vrije management slot beschikbaar (meer dan 2 posities?)");
+      return;
+     }
+   if(!PositionSelectByTicket(posTicket))
+     {
+      LogEvent(StringFormat("FOUT: InitPositionManagement kon positie ticket=%I64u niet selecteren", posTicket));
+      return;
+     }
+
+   g_positions[slot].ticket = posTicket;
+   g_positions[slot].active = true;
+   g_positions[slot].breakevenDone = false;
+   g_positions[slot].maxProfit = 0;
+   g_positions[slot].entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   g_positions[slot].posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+   // Initiele SL = entry -/+ 0.5*ATR (ATR vastgezet bij order voorbereiding, §10)
+   double atr = g_initialATR;
+   if(atr <= 0) atr = GetCurrentATR();
+   double slDist = atr * InitialSL_ATR_Multiplier;
+   if(slDist <= 0) slDist = PendingDistance*0.5; // fallback, zou niet mogen gebeuren
+
+   double slPrice;
+   if(g_positions[slot].posType == POSITION_TYPE_BUY)
+      slPrice = g_positions[slot].entryPrice - slDist;
+   else
+      slPrice = g_positions[slot].entryPrice + slDist;
+
+   g_positions[slot].initialSL = slPrice;
+
+   LogEvent(StringFormat("Positie management gestart: ticket=%I64u type=%s entry=%.5f initSL=%.5f (ATR=%.5f x %.2f)",
+            posTicket, (g_positions[slot].posType==POSITION_TYPE_BUY?"BUY":"SELL"),
+            g_positions[slot].entryPrice, slPrice, atr, InitialSL_ATR_Multiplier));
+
+   EnsureStopLoss(posTicket, slPrice);
+  }
+
+//==================== PROFIT / TRAILING MANAGEMENT ==========================
+
+double GetTickValuePerPrice()
+  {
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize<=0) return 0;
+   return tickValue/tickSize; // geld per 1.0 prijs-eenheid per lot
+  }
+
+void ManageOpenPosition(int slot)
+  {
+   if(!g_positions[slot].active) return;
+   ulong ticket = g_positions[slot].ticket;
+   if(!PositionSelectByTicket(ticket))
+     {
+      // positie is gesloten (door SL of anders)
+      LogEvent(StringFormat("Positie gesloten: ticket=%I64u (max winst was %.2f)", ticket, g_positions[slot].maxProfit));
+      g_positions[slot].active = false;
+      return;
+     }
+
+   double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   double volume = PositionGetDouble(POSITION_VOLUME);
+   double curPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+   ENUM_POSITION_TYPE ptype = g_positions[slot].posType;
+
+   // Breakeven activatie
+   if(!g_positions[slot].breakevenDone && profit >= ProfitActivation)
+     {
+      double bePrice = g_positions[slot].entryPrice;
+      // kleine marge zodat breakeven echt >=0 is na spread/commissie indien gewenst; spec vraagt "minimaal breakeven"
+      EnsureStopLoss(ticket, bePrice);
+      g_positions[slot].breakevenDone = true;
+      g_positions[slot].maxProfit = profit;
+      LogEvent(StringFormat("BREAKEVEN geactiveerd voor ticket=%I64u @ profit=%.2f -> SL=%.5f, aggressive trailing actief",
+               ticket, profit, bePrice));
+      return;
+     }
+
+   if(!g_positions[slot].breakevenDone)
+      return; // nog geen profit-activatie bereikt, alleen initiele SL geldt
+
+   // Aggressive trailing
+   if(profit > g_positions[slot].maxProfit)
+      g_positions[slot].maxProfit = profit;
+
+   double protectedProfit = g_positions[slot].maxProfit * (TrailingProfitPercentage/100.0);
+
+   double tickValPerPrice = GetTickValuePerPrice();
+   if(tickValPerPrice<=0 || volume<=0) return;
+
+   // Prijsafstand die overeenkomt met protectedProfit t.o.v. entry
+   double priceDistanceForProtected = protectedProfit / (tickValPerPrice*volume);
+
+   double newSL;
+   if(ptype == POSITION_TYPE_BUY)
+      newSL = g_positions[slot].entryPrice + priceDistanceForProtected;
+   else
+      newSL = g_positions[slot].entryPrice - priceDistanceForProtected;
+
+   double currentSL = PositionGetDouble(POSITION_SL);
+
+   bool improves = false;
+   if(ptype == POSITION_TYPE_BUY && newSL > currentSL) improves = true;
+   if(ptype == POSITION_TYPE_SELL && newSL < currentSL) improves = true;
+
+   if(improves)
+     {
+      EnsureStopLoss(ticket, newSL);
+      LogEvent(StringFormat("TRAILING update ticket=%I64u maxProfit=%.2f protected=%.2f newSL=%.5f",
+               ticket, g_positions[slot].maxProfit, protectedProfit, newSL));
+     }
+  }
+
+//==================== DIAGNOSTISCHE LOGGING (verdwenen pending order) =======
+// Deze functie beslist NOOIT over trigger-state. Ze logt uitsluitend wat er
+// aantoonbaar met een pending order gebeurd is, zodat elk geval (A/B/C/D)
+// achteraf te reconstrueren is uit de log. Wordt door CheckTriggers() nog
+// maar 1x per ticket aangeroepen (dedupe zit in CheckTriggers, niet hier).
+
+void LogPendingDisappearance(ulong ticket, string label, string reasonHint)
+  {
+   double bid = GetBid();
+   double ask = GetAsk();
+   double pendingPrice = (label=="BUY") ? g_lastBuyStopPrice : g_lastSellStopPrice;
+
+   bool selOk = OrderSelect(ticket); // actieve orders tabel
+   int orderState = -1;
+   int orderType  = -1;
+   if(selOk)
+     {
+      orderState = (int)OrderGetInteger(ORDER_STATE);
+      orderType  = (int)OrderGetInteger(ORDER_TYPE);
+     }
+
+   // Probeer aanvullende info uit de historie te halen (werkt zowel voor
+   // geannuleerde als uitgevoerde orders, mits binnen HistorySelect-window)
+   int  histOrderState = -1;
+   int  histOrderType  = -1;
+   bool histOrderFound = false;
+   datetime histFrom = TimeCurrent() - 3600; // laatste uur is ruim voldoende rond news
+   if(HistorySelect(histFrom, TimeCurrent()+60))
+     {
+      if(HistoryOrderSelect(ticket))
+        {
+         histOrderFound = true;
+         histOrderState = (int)HistoryOrderGetInteger(ticket, ORDER_STATE);
+         histOrderType  = (int)HistoryOrderGetInteger(ticket, ORDER_TYPE);
+        }
+     }
+
+   LogEvent(StringFormat("[PENDING] %s ticket=%I64u verdwenen uit actieve orders. (reden-hint: %s)", label, ticket, reasonHint));
+   LogEvent(StringFormat(
+      "[PENDING] %s ticket=%I64u details | Bid=%.5f Ask=%.5f pendingPrice=%.5f | "
+      "OrderSelect(actief)=%s orderState=%s orderType=%s",
+      label, ticket, bid, ask, pendingPrice,
+      (selOk?"true":"false"), OrderStateToString(orderState), OrderTypeToString(orderType)));
+
+   if(histOrderFound)
+     {
+      LogEvent(StringFormat("[PENDING] %s ticket=%I64u history state=%s type=%s",
+               label, ticket, OrderStateToString(histOrderState), OrderTypeToString(histOrderType)));
+
+      // Duidelijk onderscheid: sommige historie-states zijn DEFINITIEF geen fill
+      // (CANCELED/REJECTED/EXPIRED) - er zal voor dit ticket dus NOOIT nog een
+      // DEAL_ADD komen. Dit is puur informatief; er wordt geen state aangepast.
+      if(histOrderState==ORDER_STATE_CANCELED || histOrderState==ORDER_STATE_REJECTED || histOrderState==ORDER_STATE_EXPIRED)
+         LogEvent(StringFormat("[PENDING] %s ticket=%I64u is definitief NIET gevuld (%s). Er wordt geen DEAL_ADD meer verwacht voor dit ticket.",
+                  label, ticket, OrderStateToString(histOrderState)));
+      else if(histOrderState==ORDER_STATE_FILLED)
+         LogEvent(StringFormat("[PENDING] %s ticket=%I64u wacht op eventuele DEAL_ADD-confirmatie (history toont al FILLED).", label, ticket));
+     }
+   else
+     {
+      LogEvent(StringFormat("[PENDING] %s ticket=%I64u wacht op eventuele DEAL_ADD-confirmatie (nog niet in history gevonden).", label, ticket));
+     }
+  }
+
+//==================== TRIGGER DETECTION (DIAGNOSE-ONLY) ======================
+// LET OP: deze functie mag de EA-state NIET meer wijzigen. Ze detecteert
+// alleen dat een pending order niet meer "actief selecteerbaar" is (case A
+// vs niet-A) en logt dat feit. De daadwerkelijke trigger-beslissing (case D)
+// gebeurt uitsluitend in OnTradeTransaction() via TRADE_TRANSACTION_DEAL_ADD.
+//
+// FIX v1.02: dedupe. Elk ticket wordt maar 1x gelogd via g_xxxDisappearLogged
+// (+ het bijbehorende ticketnummer, zodat een eventueel volgend ticket in een
+// latere cycle gewoon weer gelogd wordt). Dit voorkomt de logspam van elke
+// 15-30ms dezelfde melding, ZONDER de trigger-detectie zelf aan te raken en
+// ZONDER een latere echte DEAL_ADD te kunnen blokkeren.
+
+void CheckTriggers()
+  {
+   if(g_buyStopTicket!=0 && !g_buyStopRemoved)
+     {
+      bool buyStillPending = OrderSelect(g_buyStopTicket);
+      if(!buyStillPending)
+        {
+         bool alreadyLogged = (g_buyStopDisappearLogged && g_buyStopDisappearLoggedTicket==g_buyStopTicket);
+         if(!alreadyLogged)
+           {
+            // Case B of C: order niet meer selecteerbaar. Dit is GEEN bewijs van fill.
+            // Alleen (eenmalig) loggen; wachten op eventuele bevestiging via OnTradeTransaction.
+            string reason = g_buyStopRemovalRequestedByUs ? "door-ons-verwijderd(pending-cancel)" : "onverwacht-niet-selecteerbaar";
+            LogPendingDisappearance(g_buyStopTicket, "BUY", reason);
+            g_buyStopDisappearLogged = true;
+            g_buyStopDisappearLoggedTicket = g_buyStopTicket;
+           }
+        }
+     }
+
+   if(g_sellStopTicket!=0 && !g_sellStopRemoved)
+     {
+      bool sellStillPending = OrderSelect(g_sellStopTicket);
+      if(!sellStillPending)
+        {
+         bool alreadyLogged = (g_sellStopDisappearLogged && g_sellStopDisappearLoggedTicket==g_sellStopTicket);
+         if(!alreadyLogged)
+           {
+            string reason = g_sellStopRemovalRequestedByUs ? "door-ons-verwijderd(pending-cancel)" : "onverwacht-niet-selecteerbaar";
+            LogPendingDisappearance(g_sellStopTicket, "SELL", reason);
+            g_sellStopDisappearLogged = true;
+            g_sellStopDisappearLoggedTicket = g_sellStopTicket;
+           }
+        }
+     }
+  }
+
+//==================== CYCLE COMPLETION CHECK =================================
+
+bool CycleFinished()
+  {
+   bool anyPositionActive = g_positions[0].active || g_positions[1].active;
+   bool anyPendingLeft = (g_buyStopTicket!=0 && !g_buyStopRemoved && OrderSelect(g_buyStopTicket)) ||
+                          (g_sellStopTicket!=0 && !g_sellStopRemoved && OrderSelect(g_sellStopTicket));
+   return (!anyPositionActive && !anyPendingLeft && g_state==STATE_TRIGGERED);
+  }
+
+//==================== MAIN LOOP (OnTick + OnTimer) =============================
+
+void ProcessCycle()
+  {
+   datetime now = TimeCurrent();
+   // gebruik ook GetTickCount64 voor sub-second precisie binnen dezelfde seconde
+   long nowMs = (long)GetTickCount64();
+
+   switch(g_state)
+     {
+      case STATE_IDLE:
+        {
+         if(now >= g_armingDateTime && now < g_newsDateTime)
+           {
+            LogEvent("ARMING START. Huidige prijs mid=" + DoubleToString(GetMid(),5));
+            g_atrCaptured = false;
+            g_initialATR = GetCurrentATR();
+            g_atrCaptured = true;
+            LogEvent(StringFormat("ATR vastgelegd voor initiele SL: %.5f (TF=%d, periode=%d)", g_initialATR, (int)ATR_Timeframe, ATR_Period));
+            PlaceInitialPendingOrders();
+            g_state = STATE_ARMED;
+           }
+         break;
+        }
+
+      case STATE_ARMED:
+        {
+         // bereken freeze-moment
+         datetime freezeStart = g_newsDateTime - (datetime)0;
+         double msUntilNews = (double)(g_newsDateTime - now)*1000.0;
+         // Omdat MQL5 datetime seconde-precisie heeft, gebruiken we TimeCurrent + fractie via GetTickCount64 niet direct vergelijkbaar.
+         // Praktische aanpak: zodra we binnen FreezeMilliseconds van de geplande seconde zijn, stoppen met modifyen.
+         if(now >= g_newsDateTime)
+           {
+            // net over de tijd heen, meteen freezen
+            FreezeOrders();
+            break;
+           }
+
+         long secsLeft = (long)(g_newsDateTime - now);
+         if(secsLeft <= 1)
+           {
+            // laatste seconde: check freeze window nauwkeuriger via milliseconden sinds start van deze seconde
+            // We benaderen dit door bij elke timer-tick (elke ~20ms) te checken of we binnen FreezeMilliseconds zitten.
+            double remainingMsApprox = secsLeft*1000.0;
+            if(remainingMsApprox <= FreezeMilliseconds)
+              {
+               FreezeOrders();
+               break;
+              }
+           }
+
+         UpdateTrailingPendingOrders();
+         break;
+        }
+
+      case STATE_FROZEN:
+        {
+         // geen modifications meer; alleen diagnostisch loggen. De echte
+         // trigger-detectie gebeurt event-driven in OnTradeTransaction().
+         CheckTriggers();
+         break;
+        }
+
+      case STATE_TRIGGERED:
+        {
+         for(int i=0;i<2;i++)
+            if(g_positions[i].active)
+               ManageOpenPosition(i);
+
+         if(CycleFinished())
+           {
+            LogEvent("CYCLE VOLTOOID. Wachten op nieuwe NewsDate/NewsTime.");
+            g_state = STATE_DONE;
+           }
+         break;
+        }
+
+      case STATE_DONE:
+        {
+         // niets doen; gebruiker moet nieuwe NewsDate/NewsTime instellen en EA herstarten voor volgende event (§24)
+         break;
+        }
+     }
+  }
+
+void FreezeOrders()
+  {
+   // FIX v1.04: alleen een geldige "bevroren prijs" rapporteren voor een kant
+   // die daadwerkelijk een actief pending ticket heeft. Als PlaceInitialPendingOrders()
+   // een kant niet kon plaatsen (bv. door te hoge spread, of - sinds v1.03/v1.04 -
+   // door onvoldoende margin), bleven g_lastBuyStopPrice/g_lastSellStopPrice op hun
+   // ongewijzigde 0-default staan; dat gaf voorheen een misleidende
+   // "FREEZE ACTIEF ... 0.00000"-melding terwijl er helemaal geen order bestond.
+   bool haveBuy  = (g_buyStopTicket  != 0 && !g_buyStopRemoved);
+   bool haveSell = (g_sellStopTicket != 0 && !g_sellStopRemoved);
+
+   g_frozenBuyPrice  = haveBuy  ? g_lastBuyStopPrice  : 0.0;
+   g_frozenSellPrice = haveSell ? g_lastSellStopPrice : 0.0;
+
+   if(haveBuy && haveSell)
+     {
+      LogEvent(StringFormat("FREEZE ACTIEF. BUY STOP bevroren @ %.5f, SELL STOP bevroren @ %.5f", g_frozenBuyPrice, g_frozenSellPrice));
+     }
+   else if(haveBuy && !haveSell)
+     {
+      LogEvent(StringFormat("FREEZE ACTIEF (GEDEELTELIJK). BUY STOP bevroren @ %.5f | SELL STOP: GEEN geldige pending order (nooit succesvol geplaatst).", g_frozenBuyPrice));
+     }
+   else if(!haveBuy && haveSell)
+     {
+      LogEvent(StringFormat("FREEZE ACTIEF (GEDEELTELIJK). SELL STOP bevroren @ %.5f | BUY STOP: GEEN geldige pending order (nooit succesvol geplaatst).", g_frozenSellPrice));
+     }
+   else
+     {
+      LogEvent("FREEZE NIET MOGELIJK: geen enkele pending order is succesvol geplaatst vóór het freeze-moment. Cycle kon NIET gewapend worden voor dit news-event (bv. door aanhoudend te hoge spread of onvoldoende margin op beide kanten). Er wordt niets bevroren en er is niets om te triggeren.");
+     }
+
+   g_state = STATE_FROZEN;
+  }
+
+void OnTick()
+  {
+   ProcessCycle();
+  }
+
+void OnTimer()
+  {
+   // Extra fijnmazige loop rond het news-moment voor snellere freeze-timing
+   // en voor diagnostische logging, zonder te wachten op een nieuwe tick.
+   // (De trigger zelf komt uit OnTradeTransaction, niet uit deze loop.)
+   if(g_state==STATE_ARMED || g_state==STATE_FROZEN || g_state==STATE_TRIGGERED)
+      ProcessCycle();
+  }
+
+//==================== TRADE TRANSACTION EVENT (ENIGE bron van trigger-waarheid) ===
+// Dit is de kern van de fix. Een pending order wordt UITSLUITEND als
+// geactiveerd (case D) beschouwd wanneer een TRADE_TRANSACTION_DEAL_ADD
+// binnenkomt waarvan de deal se DEAL_ORDER overeenkomt met onze bewaarde
+// pending ticket, met DEAL_ENTRY == DEAL_ENTRY_IN (opening deal). Pas dan
+// koppelen we via DEAL_POSITION_ID naar de daadwerkelijke positie.
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                         const MqlTradeRequest &request,
+                         const MqlTradeResult &result)
+  {
+   //---- 1) Bevestigde fill: TRADE_TRANSACTION_DEAL_ADD ----
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+     {
+      ulong dealTicket = trans.deal;
+
+      if(HistorySelect(TimeCurrent()-3600, TimeCurrent()+60) && HistoryDealSelect(dealTicket))
+        {
+         ulong  dealOrder   = (ulong)HistoryDealGetInteger(dealTicket, DEAL_ORDER);
+         long   dealEntry   = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         long   dealType    = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+         ulong  dealPosId   = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+         string dealSymbol  = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+         double dealPrice   = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+         double dealVolume  = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+
+         // FIX v1.02: alleen loggen/verwerken als dit DEAL_ORDER daadwerkelijk
+         // een van onze eigen bewaarde pending tickets is. Dit voorkomt dat
+         // de Journal vervuild raakt met deals van andere orders/symbolen,
+         // zoals expliciet gevraagd ("log alleen relevante transacties").
+         bool isOurBuy  = (g_buyStopTicket!=0  && !g_buyStopRemoved  && dealOrder==g_buyStopTicket);
+         bool isOurSell = (g_sellStopTicket!=0 && !g_sellStopRemoved && dealOrder==g_sellStopTicket);
+
+         if(isOurBuy || isOurSell)
+           {
+            string label = isOurBuy ? "BUY" : "SELL";
+            LogEvent(StringFormat(
+               "TRADE_TRANSACTION_DEAL_ADD [%s] ontvangen: deal=%I64u DEAL_ORDER=%I64u DEAL_ENTRY=%d DEAL_TYPE=%d "
+               "DEAL_POSITION_ID=%I64u DEAL_SYMBOL=%s DEAL_PRICE=%.5f DEAL_VOLUME=%.2f retcode=%d",
+               label, dealTicket, dealOrder, (int)dealEntry, (int)dealType, dealPosId, dealSymbol, dealPrice, dealVolume, (int)result.retcode));
+
+            if(dealSymbol == _Symbol && dealEntry == DEAL_ENTRY_IN)
+              {
+               // --- BUY STOP bevestigd gevuld? ---
+               if(isOurBuy)
+                 {
+                  LogEvent(StringFormat(
+                     "[TRIGGER CONFIRMED]\nBUY STOP ticket=%I64u\nDEAL=%I64u\nPOSITION_ID=%I64u\nENTRY=IN\nPRICE=%.5f\nVOLUME=%.2f",
+                     g_buyStopTicket, dealTicket, dealPosId, dealPrice, dealVolume));
+
+                  g_buyStopRemoved = true; // definitief afgehandeld (fill, niet cancel)
+                  g_buyStopTicket = 0;
+
+                  // Tegenoverliggende SELL STOP annuleren (nog steeds aanwezig?)
+                  // LET OP: deze annulering is puur opruimen, GEEN trigger-signaal.
+                  if(g_sellStopTicket!=0 && !g_sellStopRemoved)
+                    {
+                     RemovePendingOrder(g_sellStopTicket, "SELL");
+                     g_sellStopRemoved = true;
+                     g_sellStopTicket = 0;
+                    }
+
+                  InitPositionManagement(dealPosId);
+                  g_state = STATE_TRIGGERED;
+                 }
+               // --- SELL STOP bevestigd gevuld? ---
+               else if(isOurSell)
+                 {
+                  LogEvent(StringFormat(
+                     "[TRIGGER CONFIRMED]\nSELL STOP ticket=%I64u\nDEAL=%I64u\nPOSITION_ID=%I64u\nENTRY=IN\nPRICE=%.5f\nVOLUME=%.2f",
+                     g_sellStopTicket, dealTicket, dealPosId, dealPrice, dealVolume));
+
+                  g_sellStopRemoved = true;
+                  g_sellStopTicket = 0;
+
+                  if(g_buyStopTicket!=0 && !g_buyStopRemoved)
+                    {
+                     RemovePendingOrder(g_buyStopTicket, "BUY");
+                     g_buyStopRemoved = true;
+                     g_buyStopTicket = 0;
+                    }
+
+                  InitPositionManagement(dealPosId);
+                  g_state = STATE_TRIGGERED;
+                 }
+              }
+            else
+              {
+               // Deal hoort bij ons ticket maar is geen "opening"-deal op ons
+               // symbool (bv. een close-deal) - dus GEEN trigger, wel loggen.
+               LogEvent(StringFormat(
+                  "[%s] DEAL_ADD voor ons ticket=%I64u genegeerd voor trigger-doeleinden: DEAL_SYMBOL=%s (verwacht %s) of DEAL_ENTRY=%d (verwacht DEAL_ENTRY_IN)",
+                  label, dealOrder, dealSymbol, _Symbol, (int)dealEntry));
+              }
+           }
+        }
+      else
+        {
+         LogEvent(StringFormat("WAARSCHUWING: TRADE_TRANSACTION_DEAL_ADD deal=%I64u kon niet via HistoryDealSelect worden opgehaald.", dealTicket));
+        }
+     }
+
+   //---- 2) Order verwijderd/geannuleerd (case B) - uitsluitend logging, GEEN trigger ----
+   if(trans.type == TRADE_TRANSACTION_ORDER_DELETE)
+     {
+      ulong ordTicket = trans.order;
+      if((g_buyStopTicket!=0 && ordTicket==g_buyStopTicket) ||
+         (g_sellStopTicket!=0 && ordTicket==g_sellStopTicket))
+        {
+         string label = (ordTicket==g_buyStopTicket) ? "BUY" : "SELL";
+         bool expected = (label=="BUY") ? g_buyStopRemovalRequestedByUs : g_sellStopRemovalRequestedByUs;
+
+         LogEvent(StringFormat(
+            "TRADE_TRANSACTION_ORDER_DELETE [%s] ticket=%I64u (%s) | order_state=%s order_type=%s retcode=%d | "
+            "Let op: dit ALLEEN is GEEN bewijs van fill - trigger wordt alleen via DEAL_ADD bevestigd.",
+            label, ordTicket, (expected?"door-ons-geannuleerd":"ONVERWACHT-VERWIJDERD-zonder-onze-cancel"),
+            OrderStateToString((int)trans.order_state), OrderTypeToString((int)trans.order_type), (int)result.retcode));
+
+         // FIX v1.05: expliciete "ORDER REJECTED"-regel in het gevraagde format
+         // zodra we zien dat de broker de order daadwerkelijk heeft afgewezen
+         // (dit was precies het scenario uit het gerapporteerde 3.43-lots-
+         // incident: PLACED gevolgd door REJECTED ~35s later).
+         if(trans.order_state == ORDER_STATE_REJECTED)
+            LogEvent(StringFormat("ORDER REJECTED | ticket=%I64u | requestedLots=n.v.t.(zie MARGIN CHECK-log) | retcode=%d | reason=%s",
+                     ordTicket, (int)result.retcode, result.comment));
+
+         // FIX v1.02: ook hier de dedupe-vlag respecteren/zetten, zodat als
+         // CheckTriggers() dit ticket al gelogd had we niet dubbel loggen, en
+         // omgekeerd zodat CheckTriggers() het hierna niet nogmaals logt.
+         bool alreadyLogged = (label=="BUY")
+            ? (g_buyStopDisappearLogged && g_buyStopDisappearLoggedTicket==ordTicket)
+            : (g_sellStopDisappearLogged && g_sellStopDisappearLoggedTicket==ordTicket);
+
+         if(!alreadyLogged)
+           {
+            LogPendingDisappearance(ordTicket, label, "ORDER_DELETE-transactie-ontvangen");
+            if(label=="BUY") { g_buyStopDisappearLogged=true; g_buyStopDisappearLoggedTicket=ordTicket; }
+            else             { g_sellStopDisappearLogged=true; g_sellStopDisappearLoggedTicket=ordTicket; }
+           }
+
+         // Als dit een onverwachte verwijdering was (niet door ons, en er kwam
+         // geen DEAL_ADD voor dit order) blijft de EA in de huidige state en
+         // wordt er GEEN positie geopend of aangenomen. Dit is opzettelijk:
+         // we mogen de handelsstrategie niet zelf aanvullen (bv. her-arm logica)
+         // zonder expliciete instructie. De log maakt dit geval zichtbaar zodat
+         // jij kan beoordelen of dit door de broker (expiry/cancel) kwam.
+         if(!expected)
+            LogEvent(StringFormat("LET OP: pending order %I64u (%s) is verdwenen ZONDER dat wij een cancel stuurden en ZONDER bevestigde DEAL_ADD. Geen trigger, geen positie geopend.", ordTicket, label));
+        }
+     }
+
+   //---- 3) Extra diagnose: order state changes (bv. PARTIAL, EXPIRED) - alleen eigen tickets ----
+   // FIX v1.05: alleen loggen bij een ECHTE statuswijziging (dedupe via
+   // g_buyStopLastLoggedState/g_sellStopLastLoggedState), zodat identieke
+   // ORDER_UPDATE-transacties niet steeds opnieuw dezelfde regel loggen.
+   if(trans.type == TRADE_TRANSACTION_ORDER_UPDATE)
+     {
+      ulong ordTicket = trans.order;
+      if((g_buyStopTicket!=0 && ordTicket==g_buyStopTicket) ||
+         (g_sellStopTicket!=0 && ordTicket==g_sellStopTicket))
+        {
+         string label = (ordTicket==g_buyStopTicket) ? "BUY" : "SELL";
+         int newState = (int)trans.order_state;
+         int lastState = (label=="BUY") ? g_buyStopLastLoggedState : g_sellStopLastLoggedState;
+
+         if(newState != lastState)
+           {
+            LogEvent(StringFormat("TRADE_TRANSACTION_ORDER_UPDATE [%s] ticket=%I64u order_state=%s order_type=%s",
+                     label, ordTicket, OrderStateToString(newState), OrderTypeToString((int)trans.order_type)));
+
+            if(label=="BUY") g_buyStopLastLoggedState = newState;
+            else              g_sellStopLastLoggedState = newState;
+
+            if(newState == ORDER_STATE_REJECTED)
+               LogEvent(StringFormat("ORDER REJECTED | ticket=%I64u | requestedLots=n.v.t.(zie MARGIN CHECK-log) | retcode=%d | reason=order_state overgegaan naar REJECTED via ORDER_UPDATE",
+                        ordTicket, (int)result.retcode));
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
